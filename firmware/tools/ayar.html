@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<title>Trackball Bridge Ayar</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 1.3em; } h1 span { opacity:.5; font-weight:normal; font-size:.7em; }
+  button { font-size: 1em; padding: 8px 18px; border-radius: 8px; border: 1px solid #8884; cursor: pointer; }
+  #baglan { background: #2563eb; color: #fff; border: none; }
+  #kaydet { background: #16a34a; color: #fff; border: none; display: none; }
+  table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+  #tablo { display: none; }
+  td, th { padding: 8px 6px; border-bottom: 1px solid #8883; text-align: left; }
+  th { font-size: .8em; opacity: .6; text-transform: uppercase; }
+  td:first-child { font-weight: 600; white-space: nowrap; }
+  tr.basili { background: #2563eb2e; }
+  tr.basili td:first-child::after { content: " ⬤"; color: #2563eb; }
+  select { font-size: .95em; padding: 5px 8px; border-radius: 6px; width: 100%; }
+  #hizlar { display: none; }
+  #durum { margin-top: 14px; opacity: .75; min-height: 1.4em; }
+  .ipucu { font-size: .85em; opacity: .6; margin-top: 24px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<h1>🖱️ Trackball Bridge <span>tuş ayarları</span></h1>
+<button id="baglan">Bağlan</button>
+<button id="kaydet">Kalıcı kaydet</button>
+<button id="sifirla" style="display:none;background:#dc2626;color:#fff;border:none">Kilitleri sıfırla</button>
+<div id="rozetler" style="margin-top:12px"></div>
+<table id="tablo">
+  <thead><tr><th>Tuş</th><th>Normal görev</th><th>Fn katmanı görevi</th></tr></thead>
+  <tbody id="satirlar"></tbody>
+</table>
+<div id="kayitlar" style="display:none">
+  <div style="display:flex;align-items:center;gap:10px;margin-top:18px">
+    <b style="font-size:.9em">Basış kaydı</b>
+    <span id="sayac" style="font-size:.8em;opacity:.6"></span>
+    <button id="temizle" style="font-size:.8em;padding:3px 10px;margin-left:auto">Temizle</button>
+  </div>
+  <div id="liste" style="max-height:220px;overflow:auto;border:1px solid #8883;border-radius:8px;
+       margin-top:8px;padding:6px 10px;font:12px ui-monospace,Menlo,monospace;line-height:1.7">
+    <span style="opacity:.5">Henüz kayıt yok — bir tuşa bas ya da kasaya vur.</span>
+  </div>
+</div>
+<div id="hizlar">
+  <table style="display:table">
+    <tr><td>İmleç hızı: <b id="hizV">75</b>%</td>
+        <td><input type="range" id="hiz" min="25" max="150" step="5" value="75" style="width:100%"></td></tr>
+    <tr><td>Scroll hızı</td>
+        <td><select id="shiz">
+          <option value="160">Yavaş</option>
+          <option value="96" selected>Normal</option>
+          <option value="56">Hızlı</option>
+          <option value="32">Çok hızlı</option>
+        </select></td></tr>
+    <tr><td>Dikey scroll yönü</td>
+        <td><label><input type="checkbox" id="syon"> Ters çevir</label></td></tr>
+    <tr><td>Yatay scroll</td>
+        <td><label><input type="checkbox" id="yatay" checked> Açık</label>
+            &nbsp;&nbsp;<label><input type="checkbox" id="yters"> Ters çevir</label></td></tr>
+    <tr><td>Eksen rayı<br><small style="opacity:.6">eksene yakın hareket o eksene yapışır</small></td>
+        <td><label><input type="checkbox" id="kilit" checked> Açık</label></td></tr>
+    <tr><td>Kombinasyon<br><small style="opacity:.6">iki tuş birlikte</small></td>
+        <td>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <select id="ka" style="width:auto"></select> <b>+</b>
+            <select id="kb" style="width:auto"></select> <b>→</b>
+            <select id="kact" style="width:auto;flex:1"></select>
+          </div>
+        </td></tr>
+  </table>
+</div>
+<div id="durum">Cihaza bağlanmak için "Bağlan"a tıkla (Chrome gerekir).</div>
+<div class="ipucu">Fiziksel tuşa basınca satırı yanar — hangi tuş olduğunu böyle bul.
+Seçimler <b>canlı</b> uygulanır. <b>Fn katmanı</b>: bir tuşa "Fn" görevi ver;
+o tuş basılıyken diğer tuşlar Fn kolonundaki görevleri yapar (VIA katmanı gibi).
+"Hız kademesi" tuşu her basışta %50→75→100→125 döner. Beğendiysen "Kalıcı kaydet" —
+cihaz ~2sn yeniden başlar. Kaydetmezsen ayarlar fişte kaybolur.</div>
+<script>
+// Fiziksel yerleşim 2026-10-22'de ÖLÇÜLDÜ (kullanıcı sırayla bastı, pinler kaydedildi).
+// Eski isimler yay butonlarında AYNALIYDI; pin numaraları artık etikette yazıyor.
+const TUSLAR = [
+  "Büyük sol (GP26)", "Büyük sağ (GP6)", "Yay en sağ (GP10)",
+  "Yay sağ orta (GP7)", "Yay sol orta (GP13)", "Yay en sol (GP14)"
+];
+const GRUPLAR = [
+  ["Fare", [[0,"Sol tık"],[1,"Sağ tık"],[2,"Orta tık"],[3,"Geri"],[4,"İleri"]]],
+  ["Scroll", [[254,"Scroll (bas-tut)"],[252,"Scroll (aç/kapa)"]]],
+  ["Özel", [[251,"Fn katmanı (bas-tut)"],[250,"Drag kilidi (bas=tut, tekrar bas=bırak)"],[253,"Hız kademesi (%50-125)"]]],
+  ["Klavye", [[0x80,"Kopyala (⌘C)"],[0x81,"Yapıştır (⌘V)"],[0x82,"Kes (⌘X)"],[0x83,"Geri al (⌘Z)"],
+              [0x84,"Enter"],[0x85,"Esc"],[0x86,"Mission Control"],[0x87,"Uygulama değiştir (⌘Tab)"]]],
+  ["Medya", [[0x88,"Oynat / Duraklat"],[0x89,"Ses +"],[0x8A,"Ses −"],[0x8B,"Sessiz"],
+             [0x8C,"Sonraki parça"],[0x8D,"Önceki parça"]]],
+  ["Diğer", [[5,"Buton 6"],[6,"Buton 7"],[7,"Buton 8"],[255,"Devre dışı"]]]
+];
+let cihaz = null;
+let harita = [[0,1,3,2,4,5],[255,255,255,255,255,255]];   // [katman][tuş]
+let kombo = [255, 255, 255];   // [tuşA, tuşB, görev]
+const durum = m => document.getElementById("durum").textContent = m;
+
+function komboKur() {
+  const ka = document.getElementById("ka"), kb = document.getElementById("kb"),
+        kact = document.getElementById("kact");
+  [ka, kb].forEach(s => {
+    s.innerHTML = "";
+    const kapali = document.createElement("option");
+    kapali.value = 255; kapali.textContent = "— Kapalı —";
+    s.appendChild(kapali);
+    TUSLAR.forEach((ad, i) => {
+      const o = document.createElement("option");
+      o.value = i; o.textContent = ad;
+      s.appendChild(o);
+    });
+  });
+  kact.innerHTML = "";
+  GRUPLAR.forEach(([grup, list]) => {
+    const og = document.createElement("optgroup"); og.label = grup;
+    list.forEach(([v, etiket]) => {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = etiket;
+      og.appendChild(o);
+    });
+    kact.appendChild(og);
+  });
+  ka.value = kombo[0]; kb.value = kombo[1];
+  kact.value = kombo[2] === 255 ? 2 : kombo[2];
+  const gonder = async () => {
+    kombo = [+ka.value, +kb.value, +kact.value];
+    if (cihaz) {
+      await cihaz.sendFeatureReport(0, paket([0x06, ...kombo]));
+      durum("Kombinasyon uygulandı (canlı) — iki tuşa birlikte bas, dene.");
+    }
+  };
+  ka.onchange = gonder; kb.onchange = gonder; kact.onchange = gonder;
+}
+
+function paket(dizi) { const p = new Uint8Array(24); p.set(dizi); return p; }
+
+// --- Basış kaydı: her basış/bırakış ve kilit değişimi zaman damgasıyla listelenir ---
+let sonMask = 0, sonSt = 0, ilkRapor = true, basZaman = [0,0,0,0,0,0], kayitSayisi = 0;
+function kayitEkle(metin, renk) {
+  const liste = document.getElementById("liste");
+  if (kayitSayisi === 0) liste.innerHTML = "";
+  const saat = new Date().toLocaleTimeString("tr-TR", { hour12: false }) +
+               "." + String(new Date().getMilliseconds()).padStart(3, "0");
+  const satir = document.createElement("div");
+  satir.innerHTML = `<span style="opacity:.55">${saat}</span>  <span style="color:${renk}">${metin}</span>`;
+  liste.prepend(satir);
+  while (liste.childElementCount > 200) liste.lastElementChild.remove();
+  kayitSayisi++;
+  document.getElementById("sayac").textContent = `${kayitSayisi} kayıt`;
+}
+function kayitIsle(mask, st) {
+  const simdi = performance.now();
+  if (!ilkRapor) {
+    for (let i = 0; i < 6; i++) {
+      const vardi = !!(sonMask & (1 << i)), varNow = !!(mask & (1 << i));
+      if (!vardi && varNow) { basZaman[i] = simdi; kayitEkle(`▼ ${TUSLAR[i]}`, "#2563eb"); }
+      if (vardi && !varNow) {
+        const ms = basZaman[i] ? Math.round(simdi - basZaman[i]) : 0;
+        kayitEkle(`▲ ${TUSLAR[i]} — ${ms} ms${ms < 60 ? "   ⚠︎ çok kısa (darbe olabilir)" : ""}`,
+                  ms < 60 ? "#dc2626" : "#16a34a");
+      }
+    }
+    if (st !== sonSt) {
+      const k = [];
+      if (st & 1) k.push("drag kilidi");
+      if (st & 2) k.push("scroll modu");
+      if (st & 4) k.push("Fn");
+      kayitEkle(`● KİLİT: ${k.length ? k.join(" + ") + " AÇIK" : "hepsi kapandı"}`, "#d97706");
+    }
+  }
+  sonMask = mask; sonSt = st; ilkRapor = false;
+}
+
+async function bagla() {
+  try {
+    const ds = await navigator.hid.requestDevice({
+      filters: [{ vendorId: 0x2E8A, productId: 0x107B, usagePage: 0xFF60 }]
+    });
+    if (!ds.length) { durum("Cihaz seçilmedi."); return; }
+    cihaz = ds[0];
+    await cihaz.open();
+    const dv = await cihaz.receiveFeatureReport(0);
+    const off = dv.getUint8(0) === 0xA5 ? 0 : 1;
+    if (dv.getUint8(off) === 0xA5) {
+      for (let i = 0; i < 6; i++) {
+        harita[0][i] = dv.getUint8(off + 1 + i);
+        harita[1][i] = dv.getUint8(off + 7 + i);
+      }
+      const sp = dv.getUint8(off + 13), sd = dv.getUint8(off + 14), si = dv.getUint8(off + 15);
+      kombo = [dv.getUint8(off + 16), dv.getUint8(off + 17), dv.getUint8(off + 18)];
+      document.getElementById("hiz").value = sp;
+      document.getElementById("hizV").textContent = sp;
+      const sel = document.getElementById("shiz");
+      let best = 0, bd = 999;
+      [...sel.options].forEach((o, i) => { const d = Math.abs(+o.value - sd); if (d < bd) { bd = d; best = i; } });
+      sel.selectedIndex = best;
+      document.getElementById("syon").checked = !!(si & 1);
+      document.getElementById("yatay").checked = !(si & 2);
+      document.getElementById("kilit").checked = !(si & 4);
+      document.getElementById("yters").checked = !!(si & 8);
+    }
+    ciz();
+    komboKur();
+    cihaz.addEventListener("inputreport", ev => {
+      if (ev.data.byteLength < 2 || ev.data.getUint8(0) !== 0x5B) return;
+      const mask = ev.data.getUint8(1);
+      document.querySelectorAll("#satirlar tr").forEach((tr, i) =>
+        tr.classList.toggle("basili", !!(mask & (1 << i))));
+      const st = ev.data.byteLength > 2 ? ev.data.getUint8(2) : 0;
+      kayitIsle(mask, st);
+      const r = [];
+      if (st & 1) r.push("🔒 Drag kilidi AÇIK");
+      if (st & 2) r.push("🌀 Scroll modu AÇIK");
+      if (st & 4) r.push("⌥ Fn basılı");
+      document.getElementById("rozetler").innerHTML = r.map(x =>
+        `<span style="background:#dc262622;color:#dc2626;padding:4px 10px;border-radius:12px;margin-right:8px;font-size:.85em">${x}</span>`).join("");
+    });
+    document.getElementById("tablo").style.display = "table";
+    document.getElementById("hizlar").style.display = "block";
+    document.getElementById("kayitlar").style.display = "block";
+    document.getElementById("kaydet").style.display = "inline-block";
+    document.getElementById("sifirla").style.display = "inline-block";
+    durum("Bağlandı — bir tuşa bas, satırı yansın; görevini seç, anında uygulanır.");
+  } catch (e) { durum("Hata: " + e.message); }
+}
+
+function secKutusu(katman, i) {
+  const s = document.createElement("select");
+  GRUPLAR.forEach(([grup, list]) => {
+    const og = document.createElement("optgroup");
+    og.label = grup;
+    list.forEach(([v, etiket]) => {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = etiket;
+      if (v === harita[katman][i]) o.selected = true;
+      og.appendChild(o);
+    });
+    s.appendChild(og);
+  });
+  s.onchange = async () => { harita[katman][i] = +s.value; await uygula(katman); };
+  return s;
+}
+
+function ciz() {
+  const tb = document.getElementById("satirlar");
+  tb.innerHTML = "";
+  TUSLAR.forEach((ad, i) => {
+    const tr = document.createElement("tr");
+    const td1 = document.createElement("td"); td1.textContent = ad;
+    const td2 = document.createElement("td"); td2.appendChild(secKutusu(0, i));
+    const td3 = document.createElement("td"); td3.appendChild(secKutusu(1, i));
+    tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3);
+    tb.appendChild(tr);
+  });
+}
+
+async function uygula(katman) {
+  if (!cihaz) return;
+  const cmd = katman === 1 ? 0x04 : 0x01;
+  await cihaz.sendFeatureReport(0, paket([cmd, ...harita[katman]]));
+  durum("Uygulandı (canlı) — dene. Beğendiysen 'Kalıcı kaydet'.");
+}
+
+async function hizUygula() {
+  if (!cihaz) return;
+  const sp = +document.getElementById("hiz").value;
+  const sd = +document.getElementById("shiz").value;
+  const si = (document.getElementById("syon").checked ? 1 : 0)
+           | (document.getElementById("yatay").checked ? 0 : 2)
+           | (document.getElementById("kilit").checked ? 0 : 4)
+           | (document.getElementById("yters").checked ? 8 : 0);
+  document.getElementById("hizV").textContent = sp;
+  await cihaz.sendFeatureReport(0, paket([0x03, sp, sd, si]));
+  durum("Hız ayarı uygulandı (canlı).");
+}
+
+async function kaydet() {
+  if (!cihaz) return;
+  await cihaz.sendFeatureReport(0, paket([0x02]));
+  durum("Kaydedildi ✓ Cihaz yeniden başlıyor (~2sn). Tekrar ayar için yeniden 'Bağlan'.");
+  cihaz = null;
+  ["tablo","hizlar","kayitlar","kaydet","sifirla"].forEach(id => document.getElementById(id).style.display = "none");
+  document.getElementById("rozetler").innerHTML = "";
+}
+
+async function sifirla() {
+  if (!cihaz) return;
+  await cihaz.sendFeatureReport(0, paket([0x05]));
+  durum("Kilitler sıfırlandı ✓ (drag kilidi, scroll modu, katman, tuş durumları)");
+}
+
+document.getElementById("temizle").onclick = () => {
+  document.getElementById("liste").innerHTML =
+    '<span style="opacity:.5">Temizlendi — bir tuşa bas ya da kasaya vur.</span>';
+  kayitSayisi = 0; document.getElementById("sayac").textContent = "";
+};
+document.getElementById("baglan").onclick = bagla;
+document.getElementById("kaydet").onclick = kaydet;
+document.getElementById("sifirla").onclick = sifirla;
+document.getElementById("hiz").oninput = hizUygula;
+document.getElementById("shiz").onchange = hizUygula;
+document.getElementById("syon").onchange = hizUygula;
+["yatay","kilit","yters"].forEach(id => document.getElementById(id).onchange = hizUygula);
+if (!("hid" in navigator)) durum("Bu tarayıcı WebHID desteklemiyor — Chrome kullan.");
+</script>
+</body>
+</html>
