@@ -5,6 +5,8 @@
 # LaunchAgent (com.erenworks.usb-kaydedici) oturum açılınca başlatır.
 KAYIT="$HOME/Library/Logs/usb-olaylari.log"
 SINIR=$((5 * 1024 * 1024))   # 5 MB'ı geçince eskisini .1'e taşı
+# Derlenmiş kara kutu okuyucu (swiftc -O -o "<bu yol>" tools/karakutu.swift); yoksa atlanır
+SAAT="$HOME/Library/Application Support/trackball-nobet/karakutu"
 
 dondur() {
   if [ -f "$KAYIT" ] && [ "$(stat -f%z "$KAYIT")" -gt "$SINIR" ]; then
@@ -26,7 +28,11 @@ while IFS= read -r satir; do
       echo "$zaman  KOPTU      $ad" >> "$KAYIT" ;;
     *"enumerated 0x"*)
       ad=$(echo "$satir" | sed -nE 's/.*enumerated [^ ]+ \(([^/)]*).*/\1/p' | sed 's/ *$//')
-      echo "$zaman  BAĞLANDI   $ad" >> "$KAYIT" ;;
+      echo "$zaman  BAĞLANDI   $ad" >> "$KAYIT"
+      # Trackball her bağlandığında gerçek saati bildir: kara kutu kayıtlarına tarih düşsün
+      case "$ad" in "Trackball Bridge"*)
+        [ -x "$SAAT" ] && ( sleep 1.5; "$SAAT" saat >/dev/null 2>&1 ) & ;;
+      esac ;;
     *"transaction error"*)
       # sadece trackball'ın hataları, saniyede bir satır (patlamalar dosyayı şişirmesin)
       case "$satir" in *"Trackball Bridge"*)

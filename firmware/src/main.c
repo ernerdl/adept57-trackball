@@ -275,6 +275,7 @@ enum {
     EV_DP_HAZIR = 12,   // G403 veri hattını yukarı çekti (detay = bekleme/100ms)
     EV_KILIT    = 13,   // kilit durumu değişti (detay bit0=drag bit1=scroll bit2=Fn)
     EV_BOOT_TAKILDI = 14, // önceki açılış watchdog kurulmadan takıldı, erken watchdog kurtardı
+    EV_SAAT     = 15,   // Mac gerçek saati bildirdi (detay 0=ilk, 1=düzeltme)
 };
 typedef struct { uint32_t ms; uint8_t ev; uint8_t detay; } log_kayit_t;
 typedef struct {
@@ -288,6 +289,175 @@ typedef struct {
 static log_t __uninitialized_ram(g_log);
 static uint8_t log_sayfa = 0;   // ayar kanalının okuyacağı sayfa (0 = ayarlar)
 
+//--------------------------------------------------------------------
+// Kara kutu (2026-11-11): önemli olayların FLASH'taki kalıcı kopyası.
+// RAM günlüğü elektrik kesilince siliniyor; 11 Kasım'da her çıkar-tak kanıtı
+// götürdü. Burası elektrik kesilse de kalır.
+//  - Yer: ayar sektörünün hemen altında 8 sektör (32 KB), halka şeklinde.
+//  - Sektörün ilk sayfası yalnızca başlık: [KKT2][sıra no][~sıra no]. En büyük
+//    sıra no = aktif sektör. Kayıtlar 2. sayfadan başlar (sektörde 240 kayıt).
+//  - Kayıt (16 bayt, sayfaya tam 16 tane sığar): cihaz saati (sn), gerçek saat
+//    (epoch, bilinmiyorsa 0), kayıt sıra no, olay, detay, elektrik oturumu no,
+//    sağlama. Yarım kalan yazma sağlamadan anlaşılır ve okunurken atlanır.
+//  - DİKKAT (ölçüldü, 2026-11-11): bu karttaki flash yongası (JEDEC 68 10 15, Boya)
+//    sayfaya kısmi yazmada
+//    sayfanın geri kalanını KORUMUYOR — 0xFF ile doldurulan baytlar eski veriyi
+//    siliyor (Puya tipi davranış). Bu yüzden her yazma "sayfayı oku, kaydı ekle,
+//    sayfanın tamamını yaz" şeklinde yapılır; başlık da bu yüzden ayrı sayfada.
+//  - Silme (45–400 ms) YALNIZCA açılışta, core1 başlamadan yapılır; çalışırken
+//    sadece sayfa programlanır (~1 ms). Sektörde yer bitmeden açılışta yenisi açılır.
+//  - Açılış olayları hemen, çalışma sırasındakiler 3 sn sonra (sakin anda) yazılır.
+//  - Okuma: SET [0x08, ofset×3] → GET [0xA7, ofset×3, 20 ham bayt] (ofset kendi ilerler)
+//  - Saat: SET [0x09, epoch×4] — Mac her bağlantıda yollar (tools/karakutu.swift)
+//--------------------------------------------------------------------
+#define KK_SEKTOR     8
+#define KK_OFS        (MAP_FLASH_OFFSET - KK_SEKTOR * FLASH_SECTOR_SIZE)
+#define KK_BOYUT      (KK_SEKTOR * FLASH_SECTOR_SIZE)
+#define KK_MAGIC      0x4B4B5432u               // "KKT2"
+#define KK_YUVA       16
+#define KK_YUVA_SAYI  ((FLASH_SECTOR_SIZE - FLASH_PAGE_SIZE) / KK_YUVA)   // 240; ilk sayfa başlık
+#define KK_PAY        64                        // açılışta en az bu kadar boş yuva olsun
+#define KK_GECIKME_MS 3000
+#define KK_EPOCH_IMZA 0x45504F43u
+// Flash'a da yazılan olaylar (kilit ve uyku/uyanma hariç)
+#define KK_OLAYLAR ((1u<<1)|(1u<<2)|(1u<<3)|(1u<<4)|(1u<<7)|(1u<<8)|(1u<<9)|(1u<<10)|(1u<<11)|(1u<<12)|(1u<<14)|(1u<<15))
+typedef struct { uint32_t t_sn, epoch, sira; uint8_t ev, detay, guc, chk; } kk_kayit_t;
+_Static_assert(sizeof(kk_kayit_t) == KK_YUVA, "kara kutu kaydi 16 bayt olmali");
+_Static_assert(FLASH_PAGE_SIZE % KK_YUVA == 0, "kayit sayfa sinirini asmamali");
+
+static uint8_t  kk_aktif;               // yazılan sektör
+static uint16_t kk_yuva = KK_YUVA_SAYI; // sıradaki boş yuva (KK_YUVA_SAYI = yer yok)
+static uint8_t  kk_guc;                 // elektrik oturumu no (saat her sıfırlandığında artar)
+static uint32_t kk_sira = 0;            // son yazılan kaydın sıra numarası
+static bool     kk_hazir = false;
+static bool     kk_core1 = false;       // core1 çalışıyor: yazarken onu durdurmak gerek
+static uint16_t kk_dusen = 0;           // yer/kuyruk yokluğundan yazılamayan kayıt
+static uint32_t kk_sonra_ms = 0;        // yazma denemesi başarısızsa bu ana kadar bekle
+static int32_t  kk_oku_ofs = -1;        // ayar kanalı ham okuma konumu (-1 = kapalı)
+#define KK_KUYRUK 24
+static kk_kayit_t kk_q[KK_KUYRUK];
+static uint32_t   kk_q_ms[KK_KUYRUK];
+static volatile uint8_t kk_qh = 0, kk_qt = 0;
+static critical_section_t kk_cs;
+// Gerçek saat: cihaz saati 0 iken epoch kaçtı. RAM'de durur, resetlerde korunur.
+static uint32_t __uninitialized_ram(kk_epoch_imza);
+static uint32_t __uninitialized_ram(kk_epoch_taban);
+
+static uint8_t kk_chk(const kk_kayit_t *k) {
+    const uint8_t *b = (const uint8_t *)k; uint8_t c = 0xA5;
+    for (int i = 0; i < KK_YUVA - 1; i++) c ^= b[i];
+    return c;
+}
+static uint32_t kk_ofs(uint8_t s, uint16_t y) {      // kaydın flash ofseti
+    return KK_OFS + s * FLASH_SECTOR_SIZE + FLASH_PAGE_SIZE + y * KK_YUVA;
+}
+static const uint8_t *kk_adr(uint8_t s, uint16_t y) {
+    return (const uint8_t *)(XIP_BASE + kk_ofs(s, y));
+}
+static bool kk_bos(const uint8_t *p) {
+    for (int i = 0; i < KK_YUVA; i++) if (p[i] != 0xFF) return false;
+    return true;
+}
+static uint32_t kk_baslik_seq(uint8_t s) {
+    uint32_t h[3]; memcpy(h, (const void *)(XIP_BASE + KK_OFS + s * FLASH_SECTOR_SIZE), sizeof h);
+    return (h[0] == KK_MAGIC && h[2] == ~h[1] && h[1] != 0) ? h[1] : 0;
+}
+// Ham yazma: verinin düştüğü sayfayı OKUR, veriyi üstüne koyar, sayfanın tamamını
+// programlar (bkz. yukarıdaki DİKKAT notu). Veri tek sayfanın içinde kalmalı.
+// Çağıran IRQ'ları kapatmış ve core1'i durdurmuş (ya da henüz başlatmamış) olmalı.
+static void kk_yaz_ham(uint32_t ofs, const uint8_t *veri, uint32_t n) {
+    static uint8_t sayfa[FLASH_PAGE_SIZE];
+    uint32_t bas = ofs & ~(uint32_t)(FLASH_PAGE_SIZE - 1);
+    memcpy(sayfa, (const void *)(XIP_BASE + bas), FLASH_PAGE_SIZE);
+    memcpy(sayfa + (ofs - bas), veri, n);
+    flash_range_program(bas, sayfa, FLASH_PAGE_SIZE);
+}
+// Yeni sektör aç (sil + başlık). Yalnızca açılışta, core1 başlamadan çağrılır.
+static void kk_sektor_ac(uint8_t s, uint32_t seq) {
+    uint32_t h[3] = { KK_MAGIC, seq, ~seq };
+    watchdog_update();
+    uint32_t irq = save_and_disable_interrupts();
+    flash_range_erase(KK_OFS + s * FLASH_SECTOR_SIZE, FLASH_SECTOR_SIZE);
+    kk_yaz_ham(KK_OFS + s * FLASH_SECTOR_SIZE, (const uint8_t *)h, sizeof h);
+    restore_interrupts(irq);
+    watchdog_update();
+}
+static void kk_baslat(bool saat_sifirlandi) {
+    uint32_t en = 0; int akt = -1;
+    for (uint8_t s = 0; s < KK_SEKTOR; s++) {
+        uint32_t q = kk_baslik_seq(s);
+        if (q > en) { en = q; akt = s; }
+    }
+    if (akt < 0) { kk_sektor_ac(0, 1); akt = 0; en = 1; }   // ilk kullanım
+    uint16_t y = KK_YUVA_SAYI;
+    while (y > 0 && kk_bos(kk_adr((uint8_t)akt, (uint16_t)(y - 1)))) y--;
+    // Elektrik oturumu ve sıra no: son geçerli kayıttan (aktif sektör boşsa bir öncekinden)
+    kk_guc = 0; kk_sira = 0;
+    for (int tur = 0; tur < 2; tur++) {
+        uint8_t s = (uint8_t)(tur == 0 ? akt : (akt + KK_SEKTOR - 1) % KK_SEKTOR);
+        if (tur == 1 && (en < 2 || kk_baslik_seq(s) != en - 1)) break;
+        bool bulundu = false;
+        for (int i = (tur == 0 ? y : KK_YUVA_SAYI) - 1; i >= 0; i--) {
+            kk_kayit_t k; memcpy(&k, kk_adr(s, (uint16_t)i), sizeof k);
+            if (k.ev != 0 && k.ev != 0xFF && k.chk == kk_chk(&k)) {
+                kk_guc = k.guc; kk_sira = k.sira; bulundu = true; break;
+            }
+        }
+        if (bulundu) break;
+    }
+    if (saat_sifirlandi) kk_guc++;
+    if (KK_YUVA_SAYI - y < KK_PAY) {                      // yer azaldı: sıradaki sektöre geç
+        akt = (akt + 1) % KK_SEKTOR;
+        kk_sektor_ac((uint8_t)akt, en + 1);
+        y = 0;
+    }
+    kk_aktif = (uint8_t)akt; kk_yuva = y; kk_hazir = true;
+}
+// Olayı yazma kuyruğuna koy (her iki çekirdekten çağrılabilir)
+static void kk_it(uint32_t g_ms, uint8_t ev, uint8_t detay) {
+    if (ev > 31 || !((KK_OLAYLAR >> ev) & 1u)) return;
+    kk_kayit_t k = { .t_sn = g_ms / 1000,
+                     .epoch = (kk_epoch_imza == KK_EPOCH_IMZA) ? kk_epoch_taban + g_ms / 1000 : 0,
+                     .sira = 0, .ev = ev, .detay = detay, .guc = kk_guc, .chk = 0 };
+    critical_section_enter_blocking(&kk_cs);
+    uint8_t n = (uint8_t)((kk_qh + 1) % KK_KUYRUK);
+    if (n == kk_qt) kk_dusen++;
+    else { kk_q[kk_qh] = k; kk_q_ms[kk_qh] = to_ms_since_boot(get_absolute_time()); kk_qh = n; }
+    critical_section_exit(&kk_cs);
+}
+typedef struct { uint32_t ofs; kk_kayit_t k; } kk_is_t;
+static void kk_yaz_cb(void *p) {
+    kk_is_t *is = (kk_is_t *)p;
+    kk_yaz_ham(is->ofs, (const uint8_t *)&is->k, KK_YUVA);
+}
+// Kuyruğu flash'a boşalt (yalnızca core0). bekle_ms: kayıt en az bu kadar beklemiş
+// olsun (0 = hemen). hepsi=false ise çağrı başına tek kayıt yazar.
+static void kk_bosalt(uint32_t bekle_ms, bool hepsi) {
+    if (!kk_hazir) return;
+    while (kk_qt != kk_qh) {
+        uint32_t simdi = to_ms_since_boot(get_absolute_time());
+        if (bekle_ms && (simdi - kk_q_ms[kk_qt] < bekle_ms || simdi < kk_sonra_ms)) return;
+        if (kk_yuva < KK_YUVA_SAYI) {
+            kk_is_t is = { .ofs = kk_ofs(kk_aktif, kk_yuva), .k = kk_q[kk_qt] };
+            is.k.sira = kk_sira + 1;              // sıra no ve sağlama yazma anında verilir
+            is.k.chk = kk_chk(&is.k);
+            if (!kk_core1) {
+                uint32_t irq = save_and_disable_interrupts();
+                kk_yaz_cb(&is);
+                restore_interrupts(irq);
+            } else if (flash_safe_execute(kk_yaz_cb, &is, 50) != PICO_OK) {
+                kk_sonra_ms = simdi + 1000;       // core1 henüz hazır değil / meşgul: sonra dene
+                return;
+            }
+            kk_yuva++; kk_sira++;
+        } else {
+            kk_dusen++;                           // sektör doldu: bir sonraki açılışta yenisi açılır
+        }
+        kk_qt = (uint8_t)((kk_qt + 1) % KK_KUYRUK);
+        if (!hepsi) return;
+    }
+}
+
 static void log_ekle(uint8_t ev, uint8_t detay) {
     if (g_log.magic != LOG_MAGIC) {   // elektrik kesilmiş: günlüğü kur
         g_log.magic = LOG_MAGIC; g_log.head = 0; g_log.toplam = 0;
@@ -298,6 +468,7 @@ static void log_ekle(uint8_t ev, uint8_t detay) {
     g_log.k[g_log.head] = (log_kayit_t){ g, ev, detay };
     g_log.head = (uint16_t)((g_log.head + 1) % LOG_CAP);
     if (g_log.toplam < 0xFFFF) g_log.toplam++;
+    kk_it(g, ev, detay);
 }
 //--------------------------------------------------------------------
 // Erken watchdog (2026-11-11): eskiden watchdog main()'in sonunda, tud_init'ten
@@ -766,11 +937,17 @@ int main(void) {
     else if (ram_korundu)                         { ev = EV_BOOT_DIP;  host_bekleme = 800;  }
     else                                          { ev = EV_BOOT_GUC;  host_bekleme = 800;  }
     soguk_acilis = (ev != EV_BOOT_WDG);
+    // Kara kutu: RAM gittiyse cihaz saati sıfırdan başlıyor → yeni elektrik oturumu,
+    // gerçek saat de artık bilinmiyor (Mac yeniden bildirene kadar)
+    critical_section_init(&kk_cs);
+    if (!ram_korundu) kk_epoch_imza = 0;
+    kk_baslat(!ram_korundu);
     log_ekle(ev, (uint8_t)(diag_boots > 255 ? 255 : diag_boots));
     // Önceki açılış "sürüyor" işaretinde kalmış ve bizi watchdog getirmişse,
     // o açılış asıl watchdog kurulmadan takılmış demektir.
     bool acilis_takildi = (acilis_onceki == ACILIS_SURUYOR) && watchdog_caused_reboot();
     if (acilis_takildi) log_ekle(EV_BOOT_TAKILDI, 0);
+    kk_bosalt(0, true);     // açılış sebebi hemen flash'a (core1 henüz başlamadı)
 #ifdef ACILIS_TESTI
     // Yalnızca doğrulama derlemesi: ilk açılışta bilerek oyalan. Erken watchdog
     // çalışıyorsa ~3.7 sn'de resetler ve olay 14 yazılır; çalışmıyorsa 8 sn sonra
@@ -783,6 +960,7 @@ int main(void) {
     buttons_init();
 
     multicore_reset_core1();
+    kk_core1 = true;        // bundan sonra flash yazarken core1 durdurulmalı
     multicore_launch_core1(core1_main);
 
     tud_init(BOARD_TUD_RHPORT);
@@ -816,11 +994,13 @@ int main(void) {
         hid_task();
         kb_task();
         cfg_task();
+        kk_bosalt(KK_GECIKME_MS, false);   // bekleyen kara kutu kaydı varsa sakin anda yaz
         // Ayar sayfasından "kaydet" geldi: flash'a yaz (core1 güvenle durdurulur),
         // sonra temiz yeniden başlat — host hattı da sıfırdan kurulur
         if (map_save_pending) {
             map_save_pending = false;
             log_ekle(EV_KAYIT_RST, 0);
+            kk_bosalt(0, true);
             flash_safe_execute(map_flash_write_unsafe, NULL, 200);
             watchdog_hw->scratch[0] = 0;
             watchdog_reboot(0, 0, 100);
@@ -845,6 +1025,11 @@ int main(void) {
                 log_ekle(EV_DNT_RST, (uint8_t)(tries + 1));
                 watchdog_hw->scratch[2] = ((uint32_t)DIAG_MAGIC << 16) | (diag_hostlost + 1);
                 watchdog_hw->scratch[0] = ((uint32_t)RETRY_MAGIC << 16) | (tries + 1);
+                // Host yığını takılmış olabilir, core1'i durdurmayı bekleme: zaten
+                // resetleniyoruz, core1'i resette tutup bekleyen kayıtları doğrudan yaz
+                multicore_reset_core1();
+                kk_core1 = false;
+                kk_bosalt(0, true);
                 watchdog_reboot(0, 0, 50);
                 while (true) tight_loop_contents();
             }
@@ -868,6 +1053,19 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                hid_report_type_t report_type,
                                uint8_t *buffer, uint16_t reqlen) {
     (void)report_id; (void)report_type;
+    if (instance == 1 && reqlen >= 24 && kk_oku_ofs >= 0) {
+        // Kara kutu ham okuma: [0xA7][ofset×3][20 bayt]; ofset kendiliğinden ilerler
+        buffer[0] = 0xA7;
+        buffer[1] = (uint8_t)kk_oku_ofs; buffer[2] = (uint8_t)(kk_oku_ofs >> 8);
+        buffer[3] = (uint8_t)(kk_oku_ofs >> 16);
+        for (int i = 0; i < 20; i++) {
+            int32_t o = kk_oku_ofs + i;
+            buffer[4 + i] = (o < (int32_t)KK_BOYUT) ? *(const uint8_t *)(XIP_BASE + KK_OFS + (uint32_t)o) : 0xFF;
+        }
+        kk_oku_ofs += 20;
+        if (kk_oku_ofs >= (int32_t)KK_BOYUT) kk_oku_ofs = -1;
+        return 24;
+    }
     if (instance == 1 && reqlen >= 24 && log_sayfa > 0) {
         // Günlük sayfası: [0xA6][sayfa][adet][kayıt×3] — kayıt = ms(4) + olay + detay
         uint16_t adet = g_log.magic == LOG_MAGIC
@@ -946,6 +1144,21 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
             for (int i = 0; i < EXT_BTN_COUNT; i++) pend[i] = false;
         } else if (buffer[0] == 0x07) {            // günlük sayfası seç (0 = ayarlar)
             log_sayfa = buffer[1];
+            kk_oku_ofs = -1;
+        } else if (buffer[0] == 0x08) {            // kara kutu ham okuma: [ofset×3]
+            int32_t o = (int32_t)buffer[1] | ((int32_t)buffer[2] << 8) | ((int32_t)buffer[3] << 16);
+            kk_oku_ofs = (o < (int32_t)KK_BOYUT) ? o : -1;
+        } else if (buffer[0] == 0x09 && bufsize >= 5) {  // gerçek saat: [epoch×4, küçük uçlu]
+            uint32_t e = (uint32_t)buffer[1] | ((uint32_t)buffer[2] << 8) |
+                         ((uint32_t)buffer[3] << 16) | ((uint32_t)buffer[4] << 24);
+            uint32_t t = (g_log.taban_ms + to_ms_since_boot(get_absolute_time())) / 1000;
+            uint32_t taban = e - t;
+            bool vardi = (kk_epoch_imza == KK_EPOCH_IMZA);
+            uint32_t fark = taban > kk_epoch_taban ? taban - kk_epoch_taban : kk_epoch_taban - taban;
+            if (!vardi || fark > 5) {
+                kk_epoch_taban = taban; kk_epoch_imza = KK_EPOCH_IMZA;
+                log_ekle(EV_SAAT, vardi ? 1 : 0);
+            }
         } else if (buffer[0] == 0x05) {            // panik: kilitli durumları sıfırla
             states_reset();
         } else if (buffer[0] == 0x02) {            // kalıcı kaydet (haritalar + hızlar)

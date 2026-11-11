@@ -79,6 +79,10 @@ Features:
   board pulls D+ high (avoids a power-on race).
 - **On-device event log** kept in RAM that survives resets (boot reason, host
   connect/disconnect, lock changes), read with `firmware/tools/gunluk.sh`.
+- **Black box:** the important events are also written to flash (about 1,900
+  records in a ring of eight sectors), so they survive a full power loss. The
+  computer tells the device the wall-clock time, and every record carries it.
+  Read with `firmware/tools/karakutu.sh`.
 
 ### Build
 
@@ -145,7 +149,14 @@ isopropyl alcohol** every few weeks, and blow dust off the sensor lens.
 | Device vanishes from USB after a burst of resets | A boot that stalled before the watchdog was armed; fixed by the early watchdog (log event 14 records each rescue) |
 | Pointer grows huge and stutters (macOS) | macOS "Shake mouse pointer to locate" — turn it off in Accessibility |
 
-Run `firmware/tools/gunluk.sh` to see the device's own event log.
+Run `firmware/tools/gunluk.sh` to see the device's own event log, or
+`firmware/tools/karakutu.sh` for the permanent copy kept in flash.
+
+> **Flash quirk worth knowing:** the flash chip on this RP2040-Zero (JEDEC
+> `68 10 15`) does not preserve the rest of a page on a partial page program —
+> bytes written as `0xFF` wipe what was there. The black box therefore reads the
+> page, adds the record and programs the whole page, and keeps each sector
+> header on a page of its own.
 
 ---
 
