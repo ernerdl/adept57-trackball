@@ -15,6 +15,7 @@
 #include "pico/flash.h"
 #include "hardware/clocks.h"
 #include "hardware/watchdog.h"
+#include "pico/runtime.h"
 #include "hardware/flash.h"
 #include "pio_usb.h"
 #include "tusb.h"
@@ -273,6 +274,7 @@ enum {
     EV_BOOT_DIP = 11,   // gerilim çöktü (RAM korundu, tam kesinti değil)
     EV_DP_HAZIR = 12,   // G403 veri hattını yukarı çekti (detay = bekleme/100ms)
     EV_KILIT    = 13,   // kilit durumu değişti (detay bit0=drag bit1=scroll bit2=Fn)
+    EV_BOOT_TAKILDI = 14, // önceki açılış watchdog kurulmadan takıldı, erken watchdog kurtardı
 };
 typedef struct { uint32_t ms; uint8_t ev; uint8_t detay; } log_kayit_t;
 typedef struct {
@@ -297,6 +299,28 @@ static void log_ekle(uint8_t ev, uint8_t detay) {
     g_log.head = (uint16_t)((g_log.head + 1) % LOG_CAP);
     if (g_log.toplam < 0xFFFF) g_log.toplam++;
 }
+//--------------------------------------------------------------------
+// Erken watchdog (2026-11-11): eskiden watchdog main()'in sonunda, tud_init'ten
+// sonra kuruluyordu. Ondan önceki her şey (SDK'nın kristal/PLL kurulumu,
+// set_sys_clock, ayar okuma, core1 başlatma) korumasızdı: orada takılan kart
+// USB'ye hiç çıkmıyor, fiş çekilene kadar ölü kalıyordu. 11 Kasım'da reset
+// salvosunun ardından tam bu görüldü (hub "cihaz yok" dedi, çıkar-tak düzeltti).
+// Bu kanca saat kurulumundan ÖNCE çalışır. O anda clk_ref ROSC'tan (1.8–12 MHz,
+// tipik 6.5) beslendiği için süre kabadır: tipik ~3.7 sn, en az ~2 sn.
+// Normal açılış bunun çok altında main()'deki asıl 2 sn'lik watchdog'a ulaşır.
+//--------------------------------------------------------------------
+#define ACILIS_SURUYOR 0xAC1115A0u
+#define ACILIS_BITTI   0xAC11B177u
+static uint32_t __uninitialized_ram(acilis_durum);    // bu açılışın durumu
+static uint32_t __uninitialized_ram(acilis_onceki);   // bir önceki açılış nerede kaldı
+static void erken_watchdog(void) {
+    acilis_onceki = acilis_durum;
+    acilis_durum  = ACILIS_SURUYOR;
+    watchdog_start_tick(6);
+    watchdog_enable(4000, true);
+}
+PICO_RUNTIME_INIT_FUNC_HW(erken_watchdog, "00150");
+
 static uint16_t diag_hostlost = 0;   // host bağlantısı koptuğu için kaç kez resetlendi
 static uint16_t diag_boots = 0;      // elektrik geldiğinden beri kaçıncı açılış
 static bool soguk_acilis = false;    // elektrik yeni geldi (watchdog reseti değil)
@@ -743,6 +767,16 @@ int main(void) {
     else                                          { ev = EV_BOOT_GUC;  host_bekleme = 800;  }
     soguk_acilis = (ev != EV_BOOT_WDG);
     log_ekle(ev, (uint8_t)(diag_boots > 255 ? 255 : diag_boots));
+    // Önceki açılış "sürüyor" işaretinde kalmış ve bizi watchdog getirmişse,
+    // o açılış asıl watchdog kurulmadan takılmış demektir.
+    bool acilis_takildi = (acilis_onceki == ACILIS_SURUYOR) && watchdog_caused_reboot();
+    if (acilis_takildi) log_ekle(EV_BOOT_TAKILDI, 0);
+#ifdef ACILIS_TESTI
+    // Yalnızca doğrulama derlemesi: ilk açılışta bilerek oyalan. Erken watchdog
+    // çalışıyorsa ~3.7 sn'de resetler ve olay 14 yazılır; çalışmıyorsa 8 sn sonra
+    // normal devam eder (kart asla kilitli kalmaz).
+    if (!acilis_takildi) busy_wait_ms(8000);
+#endif
 
     critical_section_init(&state_cs);
     map_load();
@@ -758,6 +792,7 @@ int main(void) {
     // critical_section'ı bırakmadan çökerse core0 sonsuza dek bekliyordu —
     // cihaz USB'de görünüp arayüz açamıyor, fişi çekmeden düzelmiyordu.
     watchdog_enable(2000, true);
+    acilis_durum = ACILIS_BITTI;   // buradan sonraki resetler "açılış takılması" sayılmaz
 
     // Host bağlantı denetçisi (2026-09-23): G403 ile el sıkışma yoksa köprü
     // kendini yeniden başlatır. Eskiden bu sadece açılıştan sonraki ilk 3 saniyede

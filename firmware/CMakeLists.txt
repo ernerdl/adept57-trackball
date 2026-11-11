@@ -22,6 +22,16 @@ add_executable(trackball_bridge
 
 target_include_directories(trackball_bridge PRIVATE src)
 
+# Crystal start-up delay: the SDK default is 6 (~6 ms). If the supply is still
+# settling, a slow crystal can leave the PLL waiting for lock forever; 64 (~64 ms)
+# is the value used for boards with slow-starting crystals.
+target_compile_definitions(trackball_bridge PRIVATE PICO_XOSC_STARTUP_DELAY_MULTIPLIER=64)
+
+option(ACILIS_TESTI "Early-watchdog self test: stall on the first boot on purpose" OFF)
+if(ACILIS_TESTI)
+    target_compile_definitions(trackball_bridge PRIVATE ACILIS_TESTI=1)
+endif()
+
 option(DEBUG_EXT_TO_LEFT "Harici butonlar sol tık olarak da raporlansın (görünür test)" OFF)
 option(DEBUG_AUTO_CLICK "2sn'de bir otomatik sol tık (TX yolu testi)" OFF)
 if(DEBUG_AUTO_CLICK)
@@ -38,7 +48,6 @@ target_link_libraries(trackball_bridge PRIVATE
     tinyusb_host
     tinyusb_board
     tinyusb_pico_pio_usb
-    pico_bootsel_via_double_reset
     pico_flash
     hardware_flash
 )

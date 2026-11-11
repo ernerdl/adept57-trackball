@@ -15,6 +15,7 @@ let adlar: [UInt8: String] = [
     11: "köprü açıldı (GERİLİM ÇÖKTÜ — besleme dalgalandı)",
     12: "G403 veri hattı hazır (bekleme: detay×100ms)",
     13: "KİLİT DURUMU değişti (1=drag 2=scroll 4=Fn)",
+    14: "ÖNCEKİ AÇILIŞ TAKILDI — erken watchdog kurtardı",
 ]
 
 let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))

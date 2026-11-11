@@ -72,9 +72,11 @@ Features:
   **two-button chords**, pointer speed, keyboard shortcuts and media keys.
 - **Buttonless updates** (`firmware/tools/flash.sh`): a HID feature report puts
   the board into the bootloader, so the case never has to be opened.
-- Robustness: hardware watchdog; a supervisor that re-initialises the USB host
-  if the mouse board does not enumerate; the host is started only after the
-  mouse board pulls D+ high (avoids a power-on race).
+- Robustness: hardware watchdog, armed **before clock setup** so a boot that
+  stalls (crystal/PLL, flash, core 1) recovers by itself instead of staying
+  dead until replugged; a supervisor that re-initialises the USB host if the
+  mouse board does not enumerate; the host is started only after the mouse
+  board pulls D+ high (avoids a power-on race).
 - **On-device event log** kept in RAM that survives resets (boot reason, host
   connect/disconnect, lock changes), read with `firmware/tools/gunluk.sh`.
 
@@ -99,6 +101,11 @@ cmake --build build -j8
 
 The settings page works in Chrome on any OS. `flash.sh` and `gunluk.sh` are
 macOS scripts (Swift + IOKit).
+
+`firmware/tools/usb-kaydedici.sh` is an optional macOS helper that appends every
+USB connect/disconnect the kernel reports to `~/Library/Logs/usb-olaylari.log`
+(run it from a LaunchAgent). Useful when chasing intermittent dropouts, because
+macOS keeps its own log for only about two days.
 
 > **USB IDs:** the firmware uses the Raspberry Pi vendor ID (0x2E8A) with
 > product ID 0x107B for personal use. If you distribute devices, request your
@@ -135,6 +142,7 @@ isopropyl alcohol** every few weeks, and blow dust off the sensor lens.
 | Pointer skips on some parts of the ball | Dirty ball or dust on the lens — clean with IPA |
 | Buttons work but the ball doesn't | Mouse board did not enumerate; the supervisor retries automatically. Check the D+/D− solder joints if it persists |
 | Nothing works, device shows up but has no HID interface | Firmware hang; the watchdog recovers within 2 s |
+| Device vanishes from USB after a burst of resets | A boot that stalled before the watchdog was armed; fixed by the early watchdog (log event 14 records each rescue) |
 | Pointer grows huge and stutters (macOS) | macOS "Shake mouse pointer to locate" — turn it off in Accessibility |
 
 Run `firmware/tools/gunluk.sh` to see the device's own event log.
