@@ -74,15 +74,20 @@ Features:
   the board into the bootloader, so the case never has to be opened.
 - Robustness: hardware watchdog, armed **before clock setup** so a boot that
   stalls (crystal/PLL, flash, core 1) recovers by itself instead of staying
-  dead until replugged; a supervisor that re-initialises the USB host if the
-  mouse board does not enumerate; the host is started only after the mouse
-  board pulls D+ high (avoids a power-on race).
+  dead until replugged; a supervisor that restarts the bridge if the mouse
+  board does not enumerate; and a fix for a race in the PIO-USB handshake
+  wait that made enumeration fail on some builds (see *Handshake race* below).
 - **On-device event log** kept in RAM that survives resets (boot reason, host
   connect/disconnect, lock changes), read with `firmware/tools/gunluk.sh`.
 - **Black box:** the important events are also written to flash (about 1,900
   records in a ring of eight sectors), so they survive a full power loss. The
   computer tells the device the wall-clock time, and every record carries it.
+  Each enumeration also leaves diagnostic records (line state, transfers
+  before the first error, receiver state at the first failed transaction).
   Read with `firmware/tools/karakutu.sh`.
+- **Built-in enumeration test:** the bridge can re-enumerate the mouse board
+  N times in a row and count the outcome, with the counters kept in RAM that
+  survives resets. Run with `firmware/tools/tanima-testi.sh`.
 
 ### Build
 
@@ -144,13 +149,53 @@ isopropyl alcohol** every few weeks, and blow dust off the sensor lens.
 | Symptom | Likely cause |
 |---------|--------------|
 | Pointer skips on some parts of the ball | Dirty ball or dust on the lens — clean with IPA |
-| Buttons work but the ball doesn't | Mouse board did not enumerate; the supervisor retries automatically. Check the D+/D− solder joints if it persists |
+| Buttons work but the ball doesn't, then it comes back after 4–12 s | Mouse board failed to enumerate and the supervisor restarted the bridge. Before the handshake fix this happened on up to half of all boots; if you still see it, run `firmware/tools/tanima-testi.sh` |
+| Buttons work but the ball never comes back | Check the D+/D− solder joints |
 | Nothing works, device shows up but has no HID interface | Firmware hang; the watchdog recovers within 2 s |
 | Device vanishes from USB after a burst of resets | A boot that stalled before the watchdog was armed; fixed by the early watchdog (log event 14 records each rescue) |
 | Pointer grows huge and stutters (macOS) | macOS "Shake mouse pointer to locate" — turn it off in Accessibility |
 
 Run `firmware/tools/gunluk.sh` to see the device's own event log, or
 `firmware/tools/karakutu.sh` for the permanent copy kept in flash.
+`karakutu ham | tanima-ozet.py` summarises the enumeration diagnostics.
+
+### Handshake race in the PIO-USB host (found 2026-11-11)
+
+For three months the ball would sometimes stay dead for 4–12 seconds after
+power-on. The cause turned out to be in the bit-banged USB host, not in the
+mouse board, the cable or the dock.
+
+After the host sends a SETUP or OUT packet, the device answers with a two-byte
+handshake (sync + ACK). `pio_usb_bus_wait_handshake` in Pico-PIO-USB polls in
+a loop: first "is there a byte in the FIFO?", then "has the packet ended?".
+If the second byte lands between those two checks, the loop sees the
+end-of-packet flag and leaves with the byte still in the FIFO. The handshake
+counts as missing; three in a row fail the transfer, enumeration gives up, and
+the supervisor resets the bridge.
+
+How often this happens depends on when the function is entered relative to the
+packet, which shifts with every build — so the bug comes and goes as unrelated
+code changes. Measured on the same desk, same hardware:
+
+| Condition | Without the fix | With the fix |
+|-----------|-----------------|--------------|
+| Worst entry timing found | 8 of 50 boots enumerate | 80 of 80 |
+| Race provoked on purpose (95 % of handshakes hit it) | 0 of 20 | 80 of 80 |
+
+In the failing runs the missing byte was sitting in the FIFO every single time
+(880 of 880, 448 of 448, 175 of 175).
+
+The fix does not touch the library: the linker's `--wrap` replaces the
+function with a copy in `main.c` that, once the packet has ended with a byte
+missing, waits up to 1 µs and takes what is left in the FIFO. Nothing else
+arrives on the line after a handshake, so the wait is safe. Build options
+`HS_SARMA` and `HS_DUZELTME` (both on by default) turn the hook and the fix
+off for comparison.
+
+To reproduce: `firmware/tools/tanima-testi.sh 40 2 lib 0` runs 40 enumerations
+with the library's own function entered as early as possible;
+`... 40 3 lib 0` does the same with the rescue enabled. Mode bits and the
+phase argument are described at the top of the script.
 
 > **Flash quirk worth knowing:** the flash chip on this RP2040-Zero (JEDEC
 > `68 10 15`) does not preserve the rest of a page on a partial page program —

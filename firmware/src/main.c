@@ -15,9 +15,12 @@
 #include "pico/flash.h"
 #include "hardware/clocks.h"
 #include "hardware/watchdog.h"
+#include "hardware/timer.h"
 #include "pico/runtime.h"
 #include "hardware/flash.h"
 #include "pio_usb.h"
+#include "pio_usb_ll.h"     // diagnostics: PIO-USB root port state
+#include "host/hcd.h"       // diagnostics: to count host events
 #include "tusb.h"
 #include "usb_descriptors.h"
 
@@ -83,6 +86,7 @@ static uint8_t cfg_sdiv  = 96;   // drag-scroll böleni (küçük = hızlı kayd
 static uint8_t cfg_sinv  = 0;    // drag-scroll yönü (1 = ters)
 static uint8_t chord_a = 0xFF, chord_b = 0xFF, chord_act = 0xFF;  // kombinasyon tanımı
 static volatile bool map_save_pending = false;
+static volatile bool reset_istek = false;   // "restart" command arrived on the config channel
 
 typedef struct {
     uint32_t magic;
@@ -276,6 +280,21 @@ enum {
     EV_KILIT    = 13,   // kilit durumu değişti (detay bit0=drag bit1=scroll bit2=Fn)
     EV_BOOT_TAKILDI = 14, // önceki açılış watchdog kurulmadan takıldı, erken watchdog kurtardı
     EV_SAAT     = 15,   // Mac gerçek saati bildirdi (detay 0=ilk, 1=düzeltme)
+    // Diagnostic records (2026-11-11): why is the G403 sometimes enumerated on the 1st try, sometimes on the 3rd?
+    // Written just before the supervisor resets (and, for comparison, on every
+    // successful connection): how far the host got. Does not change behaviour.
+    EV_TANI_HAT  = 16,  // bit0 D+ high, bit1 D- high, bit2 PIO-USB "connected", bit3 full-speed,
+                        // bit4 tuh_init returned, bit5 core1 running, bit6 enumeration done (tuh_mount_cb),
+                        // bit7 D+ high at boot when measured with the pull-down enabled
+    EV_TANI_OLAY = 17,  // high nibble: attach events, low nibble: remove events
+    EV_TANI_XFER = 18,  // transfers completed before the first error (total if there was none)
+    EV_TANI_HATA = 19,  // high nibble: kind of the first error (1 failed, 2 stall, 3 timeout), low nibble: error count
+    // What was on the line at the first TRANSMISSION error (same transaction failed 3 times in a row):
+    EV_TANI_HAM  = 20,  // bit0-1 stage (0 SETUP, 1 IN, 2 OUT), bit2 device has an address,
+                        // bit3 reply packet STARTED, bit4 packet ENDED (EOP), bit5 bit-stuffing error,
+                        // bit6 sync byte correct (0x80), bit7 endpoint is not 0
+    EV_TANI_PID  = 21,  // PID byte in the receive buffer (0 = nothing; d2 ACK, 5a NAK, c3/4b data)
+    EV_TANI_SINIF= 22,  // high nibble: errors where no reply started, low nibble: reply started but was invalid
 };
 typedef struct { uint32_t ms; uint8_t ev; uint8_t detay; } log_kayit_t;
 typedef struct {
@@ -288,6 +307,52 @@ typedef struct {
 } log_t;
 static log_t __uninitialized_ram(g_log);
 static uint8_t log_sayfa = 0;   // ayar kanalının okuyacağı sayfa (0 = ayarlar)
+
+//--------------------------------------------------------------------
+// Enumeration test (2026-11-11): re-enumerates the G403 N times in a row and counts.
+// Counters live in RAM that survives resets; while a test runs NOTHING is written
+// to the black box (the first 40-run test filled a third of the ring).
+//   SET [0x0B,'T', N low, N high, mode, phase] -> start (the bridge resets itself)
+//   SET [0x0C] -> next GET: [0xA8, remaining x2, boots x2, connected x2, supervisor resets x2,
+//                complete handshakes x3, late byte x2, short0 x2, short1 x2, no reply x2, failed transactions x2, fix]
+// "Handshake" = the 2-byte ACK the G403 sends after the bridge transmits data.
+//--------------------------------------------------------------------
+#define TEST_IMZA 0x54455354u   // "TEST"
+typedef struct {
+    uint32_t imza;
+    uint16_t kalan;      // kalan deneme (0 = test yok / bitti)
+    uint8_t  duzeltme;   // bit0 = race fix in the handshake wait loop enabled
+                         // bit1 = use the library's OWN handshake function (comparison)
+                         // bit2 = also write to the black box during the test (old test condition)
+                         // bit3 = provoke the race in the copied function: phase is inserted between the two checks
+                         // bit4 = use the build default for the fix instead of bit0 (checks the shipped configuration)
+    uint8_t  faz;        // CPU cycles inserted before reading the handshake bytes (timing sweep)
+    uint16_t acilis, bagli, dnt;
+    uint32_t hs_tamam;   // handshake read completely (both bytes)
+    uint16_t hs_gec;     // a byte was missing when "packet ended" was seen, and was in the FIFO right after
+    uint16_t hs_kisa0;   // packet ended, no byte at all
+    uint16_t hs_kisa1;   // packet ended, only 1 byte
+    uint16_t hs_yok;     // reply never started
+    uint16_t iletim;     // transactions the library closed as "failed"
+} test_t;
+static test_t __uninitialized_ram(g_test);
+static bool test_oku = false;                   // next GET returns the test counters
+static volatile uint32_t test_reset_ms = 0;     // connected: restart at this time
+// Build default for the handshake fix (what applies outside a test): ON.
+// Measured on 2026-11-11: the library function missed the second byte of the
+// G403's handshake depending on timing (0-84 % failed boots depending on the build).
+#ifndef HS_DUZELTME
+#define HS_DUZELTME 1
+#endif
+static inline bool test_var(void)   { return g_test.imza == TEST_IMZA; }
+static inline bool test_aktif(void) { return g_test.imza == TEST_IMZA && g_test.kalan > 0; }
+// Test settings apply only WHILE a test runs; afterwards the build default is used
+static inline bool hs_duzeltme(void){
+    if (test_aktif() && !(g_test.duzeltme & 16)) return (g_test.duzeltme & 1) != 0;
+    return HS_DUZELTME != 0;
+}
+static inline bool hs_orijinal(void){ return test_aktif() && (g_test.duzeltme & 2); }
+static inline bool test_kk_yaz(void){ return (g_test.duzeltme & 4) != 0; }
 
 //--------------------------------------------------------------------
 // Kara kutu (2026-11-11): önemli olayların FLASH'taki kalıcı kopyası.
@@ -320,7 +385,7 @@ static uint8_t log_sayfa = 0;   // ayar kanalının okuyacağı sayfa (0 = ayarl
 #define KK_GECIKME_MS 3000
 #define KK_EPOCH_IMZA 0x45504F43u
 // Flash'a da yazılan olaylar (kilit ve uyku/uyanma hariç)
-#define KK_OLAYLAR ((1u<<1)|(1u<<2)|(1u<<3)|(1u<<4)|(1u<<7)|(1u<<8)|(1u<<9)|(1u<<10)|(1u<<11)|(1u<<12)|(1u<<14)|(1u<<15))
+#define KK_OLAYLAR ((1u<<1)|(1u<<2)|(1u<<3)|(1u<<4)|(1u<<7)|(1u<<8)|(1u<<9)|(1u<<10)|(1u<<11)|(1u<<12)|(1u<<14)|(1u<<15)|(1u<<16)|(1u<<17)|(1u<<18)|(1u<<19)|(1u<<20)|(1u<<21)|(1u<<22))
 typedef struct { uint32_t t_sn, epoch, sira; uint8_t ev, detay, guc, chk; } kk_kayit_t;
 _Static_assert(sizeof(kk_kayit_t) == KK_YUVA, "kara kutu kaydi 16 bayt olmali");
 _Static_assert(FLASH_PAGE_SIZE % KK_YUVA == 0, "kayit sayfa sinirini asmamali");
@@ -416,6 +481,7 @@ static void kk_baslat(bool saat_sifirlandi) {
 // Olayı yazma kuyruğuna koy (her iki çekirdekten çağrılabilir)
 static void kk_it(uint32_t g_ms, uint8_t ev, uint8_t detay) {
     if (ev > 31 || !((KK_OLAYLAR >> ev) & 1u)) return;
+    if (test_aktif() && !test_kk_yaz()) return;   // enumeration test running: do not fill the black box
     kk_kayit_t k = { .t_sn = g_ms / 1000,
                      .epoch = (kk_epoch_imza == KK_EPOCH_IMZA) ? kk_epoch_taban + g_ms / 1000 : 0,
                      .sira = 0, .ev = ev, .detay = detay, .guc = kk_guc, .chk = 0 };
@@ -498,6 +564,166 @@ static bool soguk_acilis = false;    // elektrik yeni geldi (watchdog reseti de�
 static uint16_t host_bekleme = 600;  // core1'in host'u başlatmadan önce bekleyeceği ms
 
 //--------------------------------------------------------------------
+// Diagnostic counters: the events the host controller reports to the USB stack are
+// counted here (hooked with the linker's --wrap option; the library is not modified).
+// Called from interrupt context; only counts, then hands over to the real handler.
+//--------------------------------------------------------------------
+static volatile uint8_t  tani_attach, tani_remove, tani_hata, tani_ilk_sonuc;
+static volatile uint16_t tani_ok, tani_ilk_ok;
+static volatile bool     tani_mount, tani_init, tani_dp_acilis;
+static volatile uint32_t tani_tur;
+
+void __real_hcd_event_handler(hcd_event_t const *event, bool in_isr);
+void __not_in_flash_func(__wrap_hcd_event_handler)(hcd_event_t const *event, bool in_isr) {
+    if (!host_mounted) {
+        switch (event->event_id) {
+            case HCD_EVENT_DEVICE_ATTACH: if (tani_attach < 15) tani_attach++; break;
+            case HCD_EVENT_DEVICE_REMOVE: if (tani_remove < 15) tani_remove++; break;
+            case HCD_EVENT_XFER_COMPLETE:
+                if (event->xfer_complete.result == XFER_RESULT_SUCCESS) {
+                    if (tani_ok < 0xFFFF) tani_ok++;
+                } else {
+                    if (!tani_hata) { tani_ilk_ok = tani_ok; tani_ilk_sonuc = event->xfer_complete.result; }
+                    if (tani_hata < 15) tani_hata++;
+                }
+                break;
+            default: break;
+        }
+    }
+    __real_hcd_event_handler(event, in_isr);
+}
+
+// Handshake wait: replaces the library's pio_usb_bus_wait_handshake (linker
+// --wrap). Same logic, with one difference: when the loop sees "packet ended" and
+// leaves with a byte missing, it checks whether the receiver pushed the last byte
+// into the FIFO in the meantime. In the 2026-11-11 test all 46 transmission errors
+// were exactly this case: packet started, ended, but the PID byte was never read.
+#ifndef HS_SARMA
+#define HS_SARMA 1      // 0: no hook, the library function is called directly (comparison build)
+#endif
+#if HS_SARMA
+uint8_t __real_pio_usb_bus_wait_handshake(pio_port_t *pp);
+uint8_t __no_inline_not_in_flash_func(__wrap_pio_usb_bus_wait_handshake)(pio_port_t *pp) {
+    if (hs_orijinal()) {            // the library's own function; if a phase is given, enter that many cycles later
+        if (g_test.faz) busy_wait_at_least_cycles(g_test.faz);
+        uint8_t r = __real_pio_usb_bus_wait_handshake(pp);
+        // Look AFTER it returns (does not disturb the timing): if the handshake was not read, what is left in the receiver?
+        if (r) g_test.hs_tamam++;
+        else if (!(pp->pio_usb_rx->irq & IRQ_RX_START_MASK)) g_test.hs_yok++;
+        else if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {                 // bayt FIFO'da bekliyor
+            g_test.hs_gec++;
+            if (g_test.duzeltme & 1) {      // rescue: take the byte(s) left behind
+                uint lvl = pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx);
+                if (lvl >= 2) pp->usb_rx_buffer[0] = (uint8_t)(pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24);
+                pp->usb_rx_buffer[1] = (uint8_t)(pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24);
+                if (pp->usb_rx_buffer[0] == USB_SYNC) r = pp->usb_rx_buffer[1];
+            }
+        }
+        else if (pp->usb_rx_buffer[0] == USB_SYNC) g_test.hs_kisa1++;
+        else g_test.hs_kisa0++;
+        return r;
+    }
+    PIO pio = pp->pio_usb_rx; uint sm = pp->sm_rx;
+    uint32_t start = timer_hw->timerawl;
+    uint32_t timeout = pp->low_speed ? 12 : 3;
+    bool basladi = false;
+    while (timer_hw->timerawl - start <= timeout) {
+        if ((pio->irq & IRQ_RX_START_MASK) != 0) { basladi = true; break; }
+    }
+    if (!basladi) { if (test_aktif()) g_test.hs_yok++; return 0; }
+
+    // Timing sweep: shift the phase of the read loop relative to the packet
+    uint32_t kiskirt = (test_aktif() && (g_test.duzeltme & 8)) ? g_test.faz : 0;
+    if (test_aktif() && g_test.faz && !kiskirt) busy_wait_at_least_cycles(g_test.faz);
+    int16_t idx = 0;
+    start = timer_hw->timerawl;
+    while (timer_hw->timerawl - start <= 7) {
+        if (idx < 2 && pio_sm_get_rx_fifo_level(pio, sm)) {
+            pp->usb_rx_buffer[idx++] = (uint8_t)(pio_sm_get(pio, sm) >> 24);
+            start = timer_hw->timerawl;
+        } else {
+            // Test: provoke the race by widening the gap between the two checks (mode bit3)
+            if (kiskirt) busy_wait_at_least_cycles(kiskirt);
+            if ((pio->irq & IRQ_RX_COMP_MASK) != 0) break;
+        }
+    }
+    if (idx == 2) {
+        if (test_aktif()) g_test.hs_tamam++;
+    } else {
+        // RACE FIX: the loop sees "FIFO empty", then "packet ended", and leaves; the
+        // receiver may have pushed the last byte in between (or right after). Nothing
+        // else arrives on the line after the packet ends, so waiting up to 1 us and
+        // taking the byte left behind is safe. (The library function does not do this.)
+        bool gec = false;
+        uint32_t t0 = timer_hw->timerawl;
+        do {
+            if (pio_sm_get_rx_fifo_level(pio, sm)) {
+                gec = true;
+                if (!hs_duzeltme()) break;
+                pp->usb_rx_buffer[idx++] = (uint8_t)(pio_sm_get(pio, sm) >> 24);
+            }
+        } while (idx < 2 && timer_hw->timerawl - t0 <= 1);
+        if (test_aktif()) {
+            if (gec) g_test.hs_gec++;
+            else if (idx == 0) g_test.hs_kisa0++; else g_test.hs_kisa1++;
+        }
+    }
+    if (idx != 2 || pp->usb_rx_buffer[0] != USB_SYNC) return 0;
+    return pp->usb_rx_buffer[1];
+}
+#endif
+
+// Hook where the host library closes a transaction as "failed": at that moment the
+// receive buffer still holds the last thing the G403 sent, and the PIO receive flags are intact.
+static volatile uint8_t tani_ham, tani_pid, tani_yok, tani_bozuk;
+static volatile bool    tani_ham_var;
+void __real_pio_usb_ll_transfer_complete(endpoint_t *ep, uint32_t flag);
+void __not_in_flash_func(__wrap_pio_usb_ll_transfer_complete)(endpoint_t *ep, uint32_t flag) {
+    if (flag == PIO_USB_INTS_ENDPOINT_ERROR_BITS && test_aktif()) g_test.iletim++;
+    if (flag == PIO_USB_INTS_ENDPOINT_ERROR_BITS && !host_mounted) {
+        pio_port_t *pp = &pio_port[0];
+        uint32_t irq = pp->pio_usb_rx->irq;
+        bool basladi = (irq & IRQ_RX_START_MASK) != 0;
+        if (basladi) { if (tani_bozuk < 15) tani_bozuk++; }
+        else         { if (tani_yok   < 15) tani_yok++; }
+        if (!tani_ham_var) {
+            uint8_t adim = (ep->data_id == USB_PID_SETUP) ? 0 : ((ep->ep_num & 0x80) ? 1 : 2);
+            tani_ham = (uint8_t)(adim | (ep->dev_addr ? 4 : 0) | (basladi ? 8 : 0)
+                     | ((irq & IRQ_RX_COMP_MASK) ? 16 : 0) | ((irq & (1u << IRQ_RX_BS_ERR)) ? 32 : 0)
+                     | (pp->usb_rx_buffer[0] == USB_SYNC ? 64 : 0) | ((ep->ep_num & 0x0f) ? 128 : 0));
+            tani_pid = pp->usb_rx_buffer[1];
+            tani_ham_var = true;
+        }
+    }
+    __real_pio_usb_ll_transfer_complete(ep, flag);
+}
+
+// hepsi=false (successful connection): only line state + transfer count, plus the
+// others if something is unusual. hepsi=true (supervisor reset): all four records.
+static void tani_yaz(bool core1_canli, bool hepsi) {
+    root_port_t *rp = PIO_USB_ROOT_PORT(0);
+    // Once the host is initialised PIO-USB INVERTS the input of both data pins (inover);
+    // undo that here so the real line level is recorded
+    bool dp = gpio_get(PIN_USB_DP), dm = gpio_get(PIN_USB_DP + 1);
+    if (tani_init) { dp = !dp; dm = !dm; }
+    uint8_t hat = (uint8_t)((dp ? 1 : 0) | (dm ? 2 : 0)
+                | (rp->connected ? 4 : 0) | (rp->is_fullspeed ? 8 : 0)
+                | (tani_init ? 16 : 0) | (core1_canli ? 32 : 0)
+                | (tani_mount ? 64 : 0) | (tani_dp_acilis ? 128 : 0));
+    uint8_t at = tani_attach, re = tani_remove, ha = tani_hata;
+    uint16_t ok = ha ? tani_ilk_ok : tani_ok;
+    log_ekle(EV_TANI_HAT, hat);
+    if (hepsi || at != 1 || re != 0) log_ekle(EV_TANI_OLAY, (uint8_t)((at << 4) | re));
+    log_ekle(EV_TANI_XFER, (uint8_t)(ok > 255 ? 255 : ok));
+    if (hepsi || ha) log_ekle(EV_TANI_HATA, (uint8_t)((tani_ilk_sonuc << 4) | ha));
+    if (tani_ham_var) {
+        log_ekle(EV_TANI_HAM, tani_ham);
+        log_ekle(EV_TANI_PID, tani_pid);
+        log_ekle(EV_TANI_SINIF, (uint8_t)((tani_yok << 4) | tani_bozuk));
+    }
+}
+
+//--------------------------------------------------------------------
 // HOST tarafı (core1): mouse'u dinle
 //--------------------------------------------------------------------
 static void core1_main(void) {
@@ -522,29 +748,54 @@ static void core1_main(void) {
     }
     uint32_t gecen = to_ms_since_boot(get_absolute_time()) - t0ms;
     log_ekle(EV_DP_HAZIR, (uint8_t)(gecen / 100 > 255 ? 255 : gecen / 100));
+    // Diagnostics: the loop above reads the pin WITHOUT a pull resistor and always reports
+    // the minimum time in the black box: is the pin floating, or is the G403 really pulling it up?
+    // Read it once with the pull-down enabled (2 ms), then restore the previous state.
+    gpio_pull_down(PIN_USB_DP);
+    sleep_ms(2);
+    tani_dp_acilis = gpio_get(PIN_USB_DP);
+    gpio_disable_pulls(PIN_USB_DP);
     sleep_ms(host_bekleme);
     pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
     pio_cfg.pin_dp = PIN_USB_DP;
     tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
     tuh_init(BOARD_TUH_RHPORT);
+    tani_init = true;
     while (true) {
         tuh_task();
+        tani_tur++;
     }
 }
 
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
                       uint8_t const *desc_report, uint16_t desc_len) {
     (void)desc_report; (void)desc_len;
-    if (!host_mounted) log_ekle(EV_G403_TAK, instance);
+    if (!host_mounted) {
+        log_ekle(EV_G403_TAK, instance); tani_yaz(true, false);
+        if (test_aktif()) {             // enumeration test: count, then restart for the next run
+            g_test.bagli++;
+            if (--g_test.kalan > 0) {
+                uint32_t t = to_ms_since_boot(get_absolute_time()) + 150;
+                test_reset_ms = t ? t : 1;
+            }
+        }
+    }
     host_mounted = true;
     watchdog_hw->scratch[0] = 0;   // başarı: tekrar-deneme bayrağını temizle
     // Her HID arayüzünü dinlemeye başla; ayıklama report ID ile yapılır
     tuh_hid_receive_report(dev_addr, instance);
 }
 
+// Enumeration (address + descriptors + drivers) finished
+void tuh_mount_cb(uint8_t daddr) { (void)daddr; tani_mount = true; }
+
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
     (void)dev_addr; (void)instance;
     log_ekle(EV_G403_KOP, instance);
+    // Diagnostic counters should now describe the re-enumeration that follows
+    tani_attach = tani_remove = tani_hata = tani_ilk_sonuc = 0;
+    tani_ok = tani_ilk_ok = 0; tani_mount = false;
+    tani_ham_var = false; tani_yok = tani_bozuk = 0;
     host_mounted = false;          // bağlantı koptu: denetçi yeniden kursun
     critical_section_enter_blocking(&state_cs);
     mouse_buttons = 0;
@@ -940,6 +1191,8 @@ int main(void) {
     // Kara kutu: RAM gittiyse cihaz saati sıfırdan başlıyor → yeni elektrik oturumu,
     // gerçek saat de artık bilinmiyor (Mac yeniden bildirene kadar)
     critical_section_init(&kk_cs);
+    if (!ram_korundu) g_test.imza = 0;        // power was lost: an unfinished test ends
+    if (test_aktif()) g_test.acilis++;
     if (!ram_korundu) kk_epoch_imza = 0;
     kk_baslat(!ram_korundu);
     log_ekle(ev, (uint8_t)(diag_boots > 255 ? 255 : diag_boots));
@@ -1006,6 +1259,19 @@ int main(void) {
             watchdog_reboot(0, 0, 100);
             while (true) tight_loop_contents();
         }
+        // Restart on command (for the enumeration test): no settings are written to flash, only
+        // a clean reset: the host port is set up from scratch and the G403 is enumerated again
+        if (test_reset_ms && to_ms_since_boot(get_absolute_time()) >= test_reset_ms) {
+            test_reset_ms = 0; reset_istek = true;
+        }
+        if (reset_istek) {
+            reset_istek = false;
+            log_ekle(EV_KAYIT_RST, 1);     // detail 1 = by command (0 = settings save)
+            kk_bosalt(0, true);
+            watchdog_hw->scratch[0] = 0;
+            watchdog_reboot(0, 0, 100);
+            while (true) tight_loop_contents();
+        }
         // Host bağlantısı yoksa (hiç kurulmadıysa ya da sonradan koptuysa) yeniden kur
         if (host_mounted) {
             lost_ms = 0;
@@ -1022,6 +1288,12 @@ int main(void) {
             // (kart gerçekten arızalıysa sonsuz reset atıp tuşları öldürmesin).
             uint32_t bekle = (tries < 20) ? (uint32_t)host_bekleme + 3000 : 30000;
             if (now_ms - lost_ms > bekle) {
+                // Diagnostics: how far did the host get BEFORE the reset? (written before EV_DNT_RST
+                // so the rule "the record right before a reset is event 9" still holds)
+                uint32_t tur0 = tani_tur;
+                busy_wait_ms(2);
+                tani_yaz(tani_tur != tur0, true);
+                if (test_aktif()) g_test.dnt++;
                 log_ekle(EV_DNT_RST, (uint8_t)(tries + 1));
                 watchdog_hw->scratch[2] = ((uint32_t)DIAG_MAGIC << 16) | (diag_hostlost + 1);
                 watchdog_hw->scratch[0] = ((uint32_t)RETRY_MAGIC << 16) | (tries + 1);
@@ -1053,6 +1325,21 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                hid_report_type_t report_type,
                                uint8_t *buffer, uint16_t reqlen) {
     (void)report_id; (void)report_type;
+    if (instance == 1 && reqlen >= 24 && test_oku) {
+        test_t t = g_test; bool v = test_var();
+        #define W16(i, x) do { buffer[i] = (uint8_t)(x); buffer[(i) + 1] = (uint8_t)((x) >> 8); } while (0)
+        memset(buffer, 0, 24);
+        buffer[0] = 0xA8;
+        if (v) {
+            W16(1, t.kalan); W16(3, t.acilis); W16(5, t.bagli); W16(7, t.dnt);
+            buffer[9] = (uint8_t)t.hs_tamam; buffer[10] = (uint8_t)(t.hs_tamam >> 8); buffer[11] = (uint8_t)(t.hs_tamam >> 16);
+            W16(12, t.hs_gec); W16(14, t.hs_kisa0); W16(16, t.hs_kisa1); W16(18, t.hs_yok); W16(20, t.iletim);
+        }
+        buffer[22] = v ? t.duzeltme : (HS_DUZELTME ? 1 : 0);
+        buffer[23] = v ? 1 : 0;
+        #undef W16
+        return 24;
+    }
     if (instance == 1 && reqlen >= 24 && kk_oku_ofs >= 0) {
         // Kara kutu ham okuma: [0xA7][ofset×3][20 bayt]; ofset kendiliğinden ilerler
         buffer[0] = 0xA7;
@@ -1144,6 +1431,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
             for (int i = 0; i < EXT_BTN_COUNT; i++) pend[i] = false;
         } else if (buffer[0] == 0x07) {            // günlük sayfası seç (0 = ayarlar)
             log_sayfa = buffer[1];
+            test_oku = false;
             kk_oku_ofs = -1;
         } else if (buffer[0] == 0x08) {            // kara kutu ham okuma: [ofset×3]
             int32_t o = (int32_t)buffer[1] | ((int32_t)buffer[2] << 8) | ((int32_t)buffer[3] << 16);
@@ -1159,6 +1447,15 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                 kk_epoch_taban = taban; kk_epoch_imza = KK_EPOCH_IMZA;
                 log_ekle(EV_SAAT, vardi ? 1 : 0);
             }
+        } else if (buffer[0] == 0x0B && buffer[1] == 'T' && bufsize >= 6) {   // start enumeration test
+            uint16_t n = (uint16_t)(buffer[2] | (buffer[3] << 8));
+            memset(&g_test, 0, sizeof g_test);
+            g_test.kalan = n; g_test.duzeltme = buffer[4]; g_test.faz = buffer[5]; g_test.imza = TEST_IMZA;
+            if (n) reset_istek = true;
+        } else if (buffer[0] == 0x0C) {                                       // read test counters
+            test_oku = true;
+        } else if (buffer[0] == 0x0A && buffer[1] == 'R' && buffer[2] == 'S' && buffer[3] == 'T') {
+            reset_istek = true;                    // restart (signed, so it cannot be triggered by accident)
         } else if (buffer[0] == 0x05) {            // panik: kilitli durumları sıfırla
             states_reset();
         } else if (buffer[0] == 0x02) {            // kalıcı kaydet (haritalar + hızlar)

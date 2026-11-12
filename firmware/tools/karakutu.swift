@@ -16,11 +16,18 @@ let adlar: [UInt8: String] = [
     7: "G403 bağlandı",
     8: "G403 KOPTU",
     9: "denetçi resetledi (host yok)",
-    10: "ayar kaydı → reset",
+    10: "ayar kaydı → reset (detay 1: komutla yeniden başlatma)",
     11: "köprü açıldı (GERİLİM ÇÖKTÜ — besleme dalgalandı)",
     12: "G403 veri hattı hazır (bekleme: detay×100ms)",
     14: "ÖNCEKİ AÇILIŞ TAKILDI — erken watchdog kurtardı",
     15: "saat eşitlendi",
+    16: "tanı: hat durumu (bit0 D+ 1 D- 2 PIO bağlı 3 FS 4 host kuruldu 5 core1 dönüyor 6 tanıma bitti 7 açılışta D+ gerçek)",
+    17: "tanı: takılma/çıkma olayı (üst/alt 4 bit)",
+    18: "tanı: ilk hatadan önceki transfer sayısı",
+    19: "tanı: ilk hata türü / hata sayısı (üst/alt 4 bit; 1 başarısız 2 stall 3 zaman aşımı)",
+    20: "tanı: ilk iletim hatasında hat (bit0-1 adım 0 istek 1 cevap alma 2 gönderme; 2 adresli; 3 paket başladı; 4 bitti; 5 dolgu hatası; 6 eşleme doğru; 7 uç≠0)",
+    21: "tanı: o anda gelen paket türü baytı (0 = hiçbir şey)",
+    22: "tanı: cevapsız / bozuk hata sayısı (üst/alt 4 bit)",
 ]
 let SEKTOR = 8, SEKTOR_BOY = 4096, SAYFA = 256, YUVA = 16, YUVA_SAYI = 240   // ilk sayfa başlık
 let arg = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "60"
